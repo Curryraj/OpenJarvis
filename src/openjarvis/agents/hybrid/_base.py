@@ -36,9 +36,12 @@ kwargs (``local_model``, ``local_endpoint``, ``cloud_endpoint``, …) follow.
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 from abc import abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from openjarvis.agents._stubs import AgentContext, AgentResult, BaseAgent
 from openjarvis.agents.hybrid._prices import (
@@ -58,6 +61,38 @@ ANTHROPIC_WEB_SEARCH_TOOL = {
     "name": "web_search",
     "max_uses": 8,
 }
+
+
+# ---------- Thread-local trace buffer ----------
+#
+# Every call through ``_call_anthropic`` / ``_call_openai`` / ``_call_vllm``
+# appends an event to the active trace if one is open. ``run()`` opens a fresh
+# trace per task and writes the digested log to
+# ``<log_dir>/<task_id>.json`` when it's done. Thread-local so concurrent
+# tasks in the runner's ThreadPoolExecutor don't stomp each other's trace.
+
+_TRACE_STATE = threading.local()
+
+
+def _trace_events() -> Optional[List[Dict[str, Any]]]:
+    return getattr(_TRACE_STATE, "events", None)
+
+
+def _record_event(event: Dict[str, Any]) -> None:
+    events = _trace_events()
+    if events is not None:
+        events.append(event)
+
+
+def _open_trace() -> List[Dict[str, Any]]:
+    events: List[Dict[str, Any]] = []
+    _TRACE_STATE.events = events
+    return events
+
+
+def _close_trace() -> None:
+    if hasattr(_TRACE_STATE, "events"):
+        delattr(_TRACE_STATE, "events")
 
 
 class LocalCloudAgent(BaseAgent):
@@ -130,10 +165,12 @@ class LocalCloudAgent(BaseAgent):
         output_config: Optional[dict] = None,
         timeout: float = 600.0,
         max_retries: int = 5,
+        trace_role: str = "cloud",
     ) -> Tuple[str, int, int, int]:
         """Single Anthropic call. Returns (text, p_tok, c_tok, n_web_searches).
 
-        Strips ``temperature`` for Opus 4.7+ (rejected by the API).
+        Strips ``temperature`` for Opus 4.7+ (rejected by the API). Captures
+        the call into the active per-task trace if one is open.
         """
         import anthropic
 
@@ -153,10 +190,28 @@ class LocalCloudAgent(BaseAgent):
             kwargs["tool_choice"] = tool_choice
         if output_config:
             kwargs["output_config"] = output_config
+        t0 = time.time()
         msg = client.messages.create(**kwargs)
+        latency = time.time() - t0
         text = "".join(b.text for b in msg.content if hasattr(b, "text"))
         srv = getattr(msg.usage, "server_tool_use", None)
         n_searches = getattr(srv, "web_search_requests", 0) if srv else 0
+        _record_event({
+            "kind": "anthropic",
+            "role": trace_role,
+            "model": model,
+            "system": system,
+            "user": user,
+            "response": text,
+            "tokens_in": msg.usage.input_tokens,
+            "tokens_out": msg.usage.output_tokens,
+            "n_web_searches": n_searches,
+            "tools": [t.get("name") for t in (tools or [])],
+            "tool_choice": tool_choice,
+            "output_config": output_config,
+            "latency_s": latency,
+            "ts": time.time(),
+        })
         return text, msg.usage.input_tokens, msg.usage.output_tokens, n_searches
 
     @staticmethod
@@ -169,8 +224,9 @@ class LocalCloudAgent(BaseAgent):
         temperature: float = 0.0,
         response_format: Optional[dict] = None,
         timeout: float = 600.0,
+        trace_role: str = "cloud",
     ) -> Tuple[str, int, int]:
-        """Single OpenAI call. Returns (text, p_tok, c_tok)."""
+        """Single OpenAI call. Returns (text, p_tok, c_tok). Trace-captured."""
         from openai import OpenAI
 
         client = OpenAI(timeout=timeout)
@@ -186,11 +242,26 @@ class LocalCloudAgent(BaseAgent):
             kwargs["temperature"] = temperature
         if response_format is not None:
             kwargs["response_format"] = response_format
+        t0 = time.time()
         resp = client.chat.completions.create(**kwargs)
+        latency = time.time() - t0
         text = resp.choices[0].message.content or ""
         u = resp.usage
         p = getattr(u, "prompt_tokens", 0) if u else 0
         c = getattr(u, "completion_tokens", 0) if u else 0
+        _record_event({
+            "kind": "openai",
+            "role": trace_role,
+            "model": model,
+            "system": system,
+            "user": user,
+            "response": text,
+            "tokens_in": p,
+            "tokens_out": c,
+            "response_format": response_format,
+            "latency_s": latency,
+            "ts": time.time(),
+        })
         return text, p, c
 
     @staticmethod
@@ -204,8 +275,10 @@ class LocalCloudAgent(BaseAgent):
         temperature: float = 0.0,
         enable_thinking: bool = False,
         timeout: float = 600.0,
+        trace_role: str = "local",
     ) -> Tuple[str, int, int]:
-        """Local vLLM (OpenAI-compatible) call. Returns (text, p_tok, c_tok)."""
+        """Local vLLM (OpenAI-compatible) call. Returns (text, p_tok, c_tok).
+        Trace-captured."""
         from openai import OpenAI
 
         client = OpenAI(base_url=endpoint, api_key="EMPTY", timeout=timeout)
@@ -213,6 +286,7 @@ class LocalCloudAgent(BaseAgent):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
+        t0 = time.time()
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
@@ -220,10 +294,27 @@ class LocalCloudAgent(BaseAgent):
             max_tokens=max_tokens,
             extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
         )
+        latency = time.time() - t0
         text = resp.choices[0].message.content or ""
         u = resp.usage
         p = getattr(u, "prompt_tokens", 0) if u else 0
         c = getattr(u, "completion_tokens", 0) if u else 0
+        _record_event({
+            "kind": "vllm",
+            "role": trace_role,
+            "model": model,
+            "endpoint": endpoint,
+            "system": system,
+            "user": user,
+            "response": text,
+            "tokens_in": p,
+            "tokens_out": c,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "enable_thinking": enable_thinking,
+            "latency_s": latency,
+            "ts": time.time(),
+        })
         return text, p, c
 
     def _call_cloud(
@@ -298,22 +389,91 @@ class LocalCloudAgent(BaseAgent):
     ) -> AgentResult:
         self._emit_turn_start(input)
         t0 = time.time()
+        events = _open_trace()
+        meta: Dict[str, Any]
+        answer: str = ""
+        soft_reason: Optional[str] = None
+        exc_obj: Optional[BaseException] = None
         try:
-            answer, meta = self._run_paradigm(input, context, **kwargs)
-        except Exception as exc:
-            soft = self._is_soft_failure(exc)
-            if soft is not None:
+            try:
+                answer, meta = self._run_paradigm(input, context, **kwargs)
+            except Exception as exc:
+                soft = self._is_soft_failure(exc)
+                if soft is None:
+                    exc_obj = exc
+                    raise
+                soft_reason = soft
                 meta = self._soft_fail_metadata(soft)
-                self._emit_turn_end(soft_error=soft)
-                return AgentResult(content="", metadata=meta, turns=0)
-            raise
+        finally:
+            # Persist the trace before the trace state is closed (and even on
+            # hard failure, so we get a record of what we did before it broke).
+            self._write_trace_log(
+                context, input, answer, meta if "meta" in locals() else {},
+                events, soft_reason, exc_obj,
+            )
+            _close_trace()
         meta.setdefault("latency_s", time.time() - t0)
+        if soft_reason is not None:
+            self._emit_turn_end(soft_error=soft_reason)
+            return AgentResult(content="", metadata=meta, turns=0)
         self._emit_turn_end(**{k: v for k, v in meta.items() if k != "traces"})
         return AgentResult(
             content=answer,
             metadata=meta,
             turns=int(meta.get("turns", 0) or 0),
         )
+
+    @staticmethod
+    def record_trace_event(event: Dict[str, Any]) -> None:
+        """Public hook for paradigm code that bypasses the SDK helpers
+        (Minions's protocol loop, Archon's layer pipeline, …) to drop a
+        custom event into the current task's trace.
+        """
+        _record_event({**event, "ts": event.get("ts", time.time())})
+
+    def _write_trace_log(
+        self,
+        context: Optional[AgentContext],
+        input: str,
+        answer: str,
+        meta: Dict[str, Any],
+        events: List[Dict[str, Any]],
+        soft_reason: Optional[str],
+        exc: Optional[BaseException],
+    ) -> None:
+        log_dir = None
+        task_id = "unknown"
+        if context is not None:
+            log_dir = context.metadata.get("log_dir")
+            task_id = context.metadata.get("task_id") or task_id
+        if not log_dir:
+            return
+        try:
+            out_dir = Path(log_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            blob = {
+                "task_id": task_id,
+                "agent": self.agent_id,
+                "cloud_model": self._cloud_model,
+                "cloud_endpoint": self._cloud_endpoint,
+                "local_model": self._local_model,
+                "local_endpoint": self._local_endpoint,
+                "cfg": self._cfg,
+                "input": input,
+                "answer": answer,
+                "metadata": meta,
+                "events": events,
+                "soft_error": soft_reason,
+                "error": (
+                    f"{type(exc).__name__}: {exc}" if exc is not None else None
+                ),
+            }
+            (out_dir / f"{task_id}.json").write_text(
+                json.dumps(blob, indent=2, default=str)
+            )
+        except Exception:
+            # Logging must never break a run.
+            pass
 
     @abstractmethod
     def _run_paradigm(

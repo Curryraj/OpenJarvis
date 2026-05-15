@@ -318,6 +318,12 @@ class ToolOrchestraAgent(LocalCloudAgent):
             history.append({
                 "role": "orchestrator", "turn": turn, "raw": text, "action": action,
             })
+            self.record_trace_event({
+                "kind": "toolorchestra_action",
+                "turn": turn,
+                "action": action,
+                "raw": text,
+            })
 
             if action is None:
                 parse_failures += 1

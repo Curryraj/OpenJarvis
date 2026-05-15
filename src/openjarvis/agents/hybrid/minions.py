@@ -390,12 +390,35 @@ class MinionsAgent(LocalCloudAgent):
                 task_meta["question"], self._cloud_endpoint, self._cloud_model
             )
 
+        if prefetch.get("text"):
+            self.record_trace_event({
+                "kind": "minions_prefetch",
+                "n_searches": prefetch["n_searches"],
+                "tokens": prefetch["tokens"],
+                "cost_usd": prefetch["cost_usd"],
+                "text": prefetch["text"],
+                "error": prefetch.get("error"),
+            })
+
         out = protocol(
             task=input,  # full formatted prompt (with bench instruction)
             context=_context_for(task_meta, prefetched=prefetch["text"]),
             doc_metadata=cfg.get("doc_metadata", "task"),
             max_rounds=cfg.get("max_rounds", 3),
         )
+
+        # The Minions library doesn't go through our SDK helpers, so the
+        # auto-trace missed every turn. Record the protocol output directly —
+        # supervisor_messages + worker_messages contain the full conversation.
+        self.record_trace_event({
+            "kind": "minions_protocol",
+            "mode": mode,
+            "supervisor_messages": out.get("supervisor_messages"),
+            "worker_messages": out.get("worker_messages"),
+            "timing": out.get("timing"),
+            "log_file": out.get("log_file"),
+            "final_answer": out.get("final_answer", ""),
+        })
 
         local_usage = out.get("local_usage")
         remote_usage = out.get("remote_usage")

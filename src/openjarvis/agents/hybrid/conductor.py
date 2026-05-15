@@ -334,6 +334,17 @@ class ConductorAgent(LocalCloudAgent):
                 "access_list": [[]],
             }
 
+        self.record_trace_event({
+            "kind": "conductor_plan",
+            "plan": plan,
+            "fallback_used": fallback_used,
+            "parse_attempts": parse_attempts,
+            "workers": [
+                {k: v for k, v in w.items() if k != "api_key"}
+                for w in workers
+            ],
+        })
+
         # 2. Execute
         steps: List[Dict[str, Any]] = []
         tokens_local = 0
@@ -346,6 +357,16 @@ class ConductorAgent(LocalCloudAgent):
         ):
             worker = workers[mid]
             prompt = _build_step_prompt(question, subtask, steps, access)
+            self.record_trace_event({
+                "kind": "conductor_step_dispatch",
+                "step_idx": i,
+                "worker_id": mid,
+                "worker_name": worker["name"],
+                "worker_model": worker["model"],
+                "subtask": subtask,
+                "access": access,
+                "prompt": prompt,
+            })
             text, w_in, w_out, is_local = _call_worker(worker, prompt, cfg)
             if is_local:
                 tokens_local += w_in + w_out

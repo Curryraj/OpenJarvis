@@ -257,7 +257,11 @@ def _build_agent(cell: Dict[str, Any]):
 def _run_one(agent, bench: str, task: Dict[str, Any], log_dir: str) -> Dict[str, Any]:
     """Run the agent on one task. Returns a hybrid-shape row."""
     prompt = _format_prompt(task)
-    ctx = AgentContext(metadata={"task": task, "task_id": task["task_id"]})
+    ctx = AgentContext(metadata={
+        "task": task,
+        "task_id": task["task_id"],
+        "log_dir": log_dir,
+    })
     t0 = time.time()
     try:
         result: AgentResult = agent.run(prompt, ctx)

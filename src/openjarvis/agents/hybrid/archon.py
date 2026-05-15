@@ -41,7 +41,7 @@ import types
 from typing import Any, Dict, Optional, Tuple
 
 from openjarvis.agents._stubs import AgentContext
-from openjarvis.agents.hybrid._base import LocalCloudAgent
+from openjarvis.agents.hybrid._base import LocalCloudAgent, _record_event
 from openjarvis.agents.hybrid._prices import NO_TEMP_PREFIXES, cost as _cost_cloud
 from openjarvis.core.registry import AgentRegistry
 
@@ -112,6 +112,8 @@ def _make_local_generator(local_endpoint: str, local_model: str):
     client = OpenAI(base_url=local_endpoint, api_key="EMPTY")
 
     def local_gen(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
+        import time as _time
+        t0 = _time.time()
         try:
             resp = client.chat.completions.create(
                 model=local_model,
@@ -120,12 +122,32 @@ def _make_local_generator(local_endpoint: str, local_model: str):
                 temperature=temperature,
             )
         except Exception as e:
+            _record_event({
+                "kind": "archon_local_gen_error",
+                "model": local_model,
+                "messages": messages,
+                "error": f"{type(e).__name__}: {e}",
+                "ts": _time.time(),
+            })
             return f"[local-vllm error: {e!r}]"
         u = resp.usage
         if u:
             _TOKEN_TALLY["local_prompt"] += getattr(u, "prompt_tokens", 0) or 0
             _TOKEN_TALLY["local_completion"] += getattr(u, "completion_tokens", 0) or 0
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        _record_event({
+            "kind": "archon_local_gen",
+            "model": local_model,
+            "messages": messages,
+            "response": text,
+            "tokens_in": getattr(u, "prompt_tokens", 0) if u else 0,
+            "tokens_out": getattr(u, "completion_tokens", 0) if u else 0,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "latency_s": _time.time() - t0,
+            "ts": _time.time(),
+        })
+        return text
 
     return local_gen
 
@@ -138,6 +160,7 @@ def _wrap_archon_cloud_generators() -> None:
     import anthropic as _anth
 
     def gen_openai(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
+        import time as _time
         client = _OAI()
         kwargs: Dict[str, Any] = dict(
             model=model, messages=messages,
@@ -148,14 +171,27 @@ def _wrap_archon_cloud_generators() -> None:
             kwargs.pop("temperature", None)
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
+        t0 = _time.time()
         resp = client.chat.completions.create(**kwargs)
         u = resp.usage
         if u:
             _TOKEN_TALLY["cloud_prompt"] += getattr(u, "prompt_tokens", 0) or 0
             _TOKEN_TALLY["cloud_completion"] += getattr(u, "completion_tokens", 0) or 0
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        _record_event({
+            "kind": "archon_cloud_openai",
+            "model": model,
+            "messages": messages,
+            "response": text,
+            "tokens_in": getattr(u, "prompt_tokens", 0) if u else 0,
+            "tokens_out": getattr(u, "completion_tokens", 0) if u else 0,
+            "latency_s": _time.time() - t0,
+            "ts": _time.time(),
+        })
+        return text
 
     def gen_anthropic(model, messages, max_tokens=2048, temperature=0.7, **_kw):  # type: ignore[no-untyped-def]
+        import time as _time
         client = _anth.Anthropic(timeout=600.0)
         system = ""
         msgs = []
@@ -169,12 +205,24 @@ def _wrap_archon_cloud_generators() -> None:
         )
         if not model.startswith(NO_TEMP_PREFIXES):
             kwargs["temperature"] = temperature
+        t0 = _time.time()
         resp = client.messages.create(**kwargs)
         text = "".join(b.text for b in resp.content if hasattr(b, "text"))
         u = resp.usage
         if u:
             _TOKEN_TALLY["cloud_prompt"] += getattr(u, "input_tokens", 0) or 0
             _TOKEN_TALLY["cloud_completion"] += getattr(u, "output_tokens", 0) or 0
+        _record_event({
+            "kind": "archon_cloud_anthropic",
+            "model": model,
+            "system": system,
+            "messages": msgs,
+            "response": text.strip(),
+            "tokens_in": getattr(u, "input_tokens", 0) if u else 0,
+            "tokens_out": getattr(u, "output_tokens", 0) if u else 0,
+            "latency_s": _time.time() - t0,
+            "ts": _time.time(),
+        })
         return text.strip()
 
     from archon.completions.components.Generator import GENERATE_MAP as _GMAP  # type: ignore[import-not-found]

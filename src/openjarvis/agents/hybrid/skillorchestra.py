@@ -258,6 +258,15 @@ class SkillOrchestraAgent(LocalCloudAgent):
         if chosen not in competence:
             chosen = max(scored, key=lambda a: scored[a]["final_score"])
 
+        self.record_trace_event({
+            "kind": "skillorchestra_route",
+            "chosen_agent": chosen,
+            "skill_weights": skill_weights,
+            "agent_scores": scored,
+            "reasoning": decision.get("reasoning", ""),
+            "router_raw": router_text,
+        })
+
         tokens_local = 0
         tokens_cloud = r_in + r_out
         run_cost = self.cost_usd(self._cloud_model, r_in, r_out)
