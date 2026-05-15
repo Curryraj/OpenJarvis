@@ -95,6 +95,64 @@ def _close_trace() -> None:
         delattr(_TRACE_STATE, "events")
 
 
+def _serialize_block(block: Any) -> Dict[str, Any]:
+    """Turn an Anthropic content block (text / tool_use / server_tool_use /
+    web_search_tool_result / thinking) into a JSON-safe dict.
+
+    Each block type carries different fields; we extract everything we can
+    so the per-task log file is a complete record of what the model emitted
+    (including every tool call request and tool result body).
+    """
+    out: Dict[str, Any] = {"type": getattr(block, "type", type(block).__name__)}
+    for attr in (
+        "id", "name", "input", "text", "thinking", "signature",
+        "tool_use_id", "content",
+    ):
+        if hasattr(block, attr):
+            val = getattr(block, attr)
+            # Nested content (e.g. web_search_tool_result.content is a list of
+            # citation/result blocks). Recurse for completeness.
+            if attr == "content" and isinstance(val, list):
+                out[attr] = [_serialize_block(b) for b in val]
+            else:
+                out[attr] = _jsonable(val)
+    return out
+
+
+def _serialize_openai_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+    """vLLM / OpenAI returns ChatCompletionMessageToolCall objects. Pull out
+    id, type, name, and the (JSON-string) arguments so they're round-trippable."""
+    out: List[Dict[str, Any]] = []
+    if not tool_calls:
+        return out
+    for tc in tool_calls:
+        fn = getattr(tc, "function", None)
+        out.append({
+            "id": getattr(tc, "id", None),
+            "type": getattr(tc, "type", "function"),
+            "function": {
+                "name": getattr(fn, "name", None) if fn else None,
+                "arguments": getattr(fn, "arguments", None) if fn else None,
+            },
+        })
+    return out
+
+
+def _jsonable(v: Any) -> Any:
+    """Best-effort JSON-friendly conversion. Pydantic models → .model_dump(),
+    dataclasses untouched (json.dumps handles them via default=str)."""
+    if hasattr(v, "model_dump"):
+        try:
+            return v.model_dump()
+        except Exception:
+            pass
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    return v
+
+
 class LocalCloudAgent(BaseAgent):
     """Base for paradigm agents that coordinate a local + cloud model pair.
 
@@ -196,6 +254,13 @@ class LocalCloudAgent(BaseAgent):
         text = "".join(b.text for b in msg.content if hasattr(b, "text"))
         srv = getattr(msg.usage, "server_tool_use", None)
         n_searches = getattr(srv, "web_search_requests", 0) if srv else 0
+        content_blocks = [_serialize_block(b) for b in msg.content]
+        tool_use_blocks = [b for b in content_blocks if b.get("type") in (
+            "tool_use", "server_tool_use",
+        )]
+        tool_result_blocks = [b for b in content_blocks if b.get("type") in (
+            "web_search_tool_result", "tool_result",
+        )]
         _record_event({
             "kind": "anthropic",
             "role": trace_role,
@@ -203,12 +268,16 @@ class LocalCloudAgent(BaseAgent):
             "system": system,
             "user": user,
             "response": text,
+            "content_blocks": content_blocks,
+            "tool_calls": tool_use_blocks,
+            "tool_results": tool_result_blocks,
             "tokens_in": msg.usage.input_tokens,
             "tokens_out": msg.usage.output_tokens,
             "n_web_searches": n_searches,
-            "tools": [t.get("name") for t in (tools or [])],
+            "tools_declared": tools,
             "tool_choice": tool_choice,
             "output_config": output_config,
+            "stop_reason": getattr(msg, "stop_reason", None),
             "latency_s": latency,
             "ts": time.time(),
         })
@@ -223,10 +292,13 @@ class LocalCloudAgent(BaseAgent):
         max_tokens: int = 4096,
         temperature: float = 0.0,
         response_format: Optional[dict] = None,
+        tools: Optional[list] = None,
+        tool_choice: Optional[Any] = None,
         timeout: float = 600.0,
         trace_role: str = "cloud",
     ) -> Tuple[str, int, int]:
-        """Single OpenAI call. Returns (text, p_tok, c_tok). Trace-captured."""
+        """Single OpenAI call. Returns (text, p_tok, c_tok). Trace-captured;
+        also records any tool_calls the model emits."""
         from openai import OpenAI
 
         client = OpenAI(timeout=timeout)
@@ -242,10 +314,20 @@ class LocalCloudAgent(BaseAgent):
             kwargs["temperature"] = temperature
         if response_format is not None:
             kwargs["response_format"] = response_format
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         t0 = time.time()
         resp = client.chat.completions.create(**kwargs)
         latency = time.time() - t0
-        text = resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        message = choice.message
+        text = message.content or ""
+        tool_calls = _serialize_openai_tool_calls(getattr(message, "tool_calls", None))
+        reasoning = getattr(message, "reasoning_content", None) or getattr(
+            message, "reasoning", None
+        )
         u = resp.usage
         p = getattr(u, "prompt_tokens", 0) if u else 0
         c = getattr(u, "completion_tokens", 0) if u else 0
@@ -256,9 +338,14 @@ class LocalCloudAgent(BaseAgent):
             "system": system,
             "user": user,
             "response": text,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning,
             "tokens_in": p,
             "tokens_out": c,
             "response_format": response_format,
+            "tools_declared": tools,
+            "tool_choice": tool_choice,
+            "finish_reason": getattr(choice, "finish_reason", None),
             "latency_s": latency,
             "ts": time.time(),
         })
@@ -274,11 +361,16 @@ class LocalCloudAgent(BaseAgent):
         max_tokens: int = 4096,
         temperature: float = 0.0,
         enable_thinking: bool = False,
+        tools: Optional[list] = None,
+        tool_choice: Optional[Any] = None,
         timeout: float = 600.0,
         trace_role: str = "local",
     ) -> Tuple[str, int, int]:
         """Local vLLM (OpenAI-compatible) call. Returns (text, p_tok, c_tok).
-        Trace-captured."""
+        Captures the full response into the trace — including any tool_calls
+        the local model emits (vLLM exposes them in
+        ``resp.choices[0].message.tool_calls`` when ``--enable-auto-tool-choice``
+        is on)."""
         from openai import OpenAI
 
         client = OpenAI(base_url=endpoint, api_key="EMPTY", timeout=timeout)
@@ -286,16 +378,27 @@ class LocalCloudAgent(BaseAgent):
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
-        t0 = time.time()
-        resp = client.chat.completions.create(
+        kwargs: Dict[str, Any] = dict(
             model=model,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
         )
+        if tools:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        t0 = time.time()
+        resp = client.chat.completions.create(**kwargs)
         latency = time.time() - t0
-        text = resp.choices[0].message.content or ""
+        choice = resp.choices[0]
+        message = choice.message
+        text = message.content or ""
+        tool_calls = _serialize_openai_tool_calls(getattr(message, "tool_calls", None))
+        reasoning = getattr(message, "reasoning_content", None) or getattr(
+            message, "reasoning", None
+        )
         u = resp.usage
         p = getattr(u, "prompt_tokens", 0) if u else 0
         c = getattr(u, "completion_tokens", 0) if u else 0
@@ -307,11 +410,16 @@ class LocalCloudAgent(BaseAgent):
             "system": system,
             "user": user,
             "response": text,
+            "tool_calls": tool_calls,
+            "reasoning_content": reasoning,
             "tokens_in": p,
             "tokens_out": c,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "enable_thinking": enable_thinking,
+            "tools_declared": tools,
+            "tool_choice": tool_choice,
+            "finish_reason": getattr(choice, "finish_reason", None),
             "latency_s": latency,
             "ts": time.time(),
         })
