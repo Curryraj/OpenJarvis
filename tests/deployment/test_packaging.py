@@ -17,6 +17,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parent.parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
 DESKTOP_LIB_RS = ROOT / "frontend" / "src-tauri" / "src" / "lib.rs"
+WINDOWS_INSTALL_PS1 = ROOT / "deploy" / "windows" / "install.ps1"
 
 
 def _pyproject() -> dict:
@@ -46,4 +47,15 @@ def test_desktop_app_syncs_the_native_group() -> None:
     assert '"desktop-native"' in DESKTOP_LIB_RS.read_text(), (
         "the desktop app must `uv sync --group desktop-native` so the native "
         "extension is built at launch."
+    )
+
+
+def test_windows_installer_syncs_the_native_group() -> None:
+    # The Windows source installer does not run maturin separately.
+    assert (
+        "& $uvExe sync --extra desktop --group desktop-native"
+        in WINDOWS_INSTALL_PS1.read_text()
+    ), (
+        "the Windows installer must include `--group desktop-native` so "
+        "openjarvis_rust is built during source install."
     )
