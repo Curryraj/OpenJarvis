@@ -381,10 +381,10 @@ class OrchestratorGRPOTrainer:
         return records
 
     def _make_policy_caller(self, turn_buffer):
-        """Build a policy-driven ``call_orchestrator(system, user, specs)``.
+        """Build a policy-driven ``call_orchestrator(messages, specs)``.
 
-        Tokenizes ``system+user`` with the model's chat template, generates ONE
-        assistant turn with the current policy, parses any
+        Tokenizes the running ``messages`` conversation with the model's chat
+        template, generates ONE assistant turn with the current policy, parses any
         ``<tool_call>{...}</tool_call>``, appends the per-turn
         ``(input_ids, generated_ids)`` to ``turn_buffer`` (for the later
         log-prob pass), and returns
@@ -397,11 +397,7 @@ class OrchestratorGRPOTrainer:
 
         tok = self.policy.tokenizer
 
-        def call_orchestrator(system: str, user: str, specs):
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ]
+        def call_orchestrator(messages, specs):
             input_ids = tok.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=True
             )

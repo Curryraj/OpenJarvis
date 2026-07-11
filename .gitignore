@@ -133,3 +133,7 @@ oj-debug.*.json
 
 # Generated orchestrator SFT/eval data artifacts
 data/
+
+# Training run artifacts (model checkpoints + W&B run dirs — regenerated, large)
+checkpoints/
+wandb/
