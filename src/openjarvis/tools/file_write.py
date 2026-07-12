@@ -23,7 +23,11 @@ class FileWriteTool(BaseTool):
         self,
         allowed_dirs: Optional[List[str]] = None,
     ) -> None:
-        self._allowed_dirs = [Path(d).resolve() for d in (allowed_dirs or [])]
+        if allowed_dirs is None:
+            from openjarvis.tools.fs_sandbox import default_allowed_dirs
+
+            allowed_dirs = default_allowed_dirs()
+        self._allowed_dirs = [Path(d).resolve() for d in allowed_dirs]
 
     @property
     def spec(self) -> ToolSpec:

@@ -975,6 +975,10 @@ class ToolsConfig:
     mcp: MCPConfig = field(default_factory=MCPConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     enabled: str = ""  # comma-separated default tools
+    # Comma-separated directories file_read/file_write may touch. Empty
+    # string means "use the computed default" (project root + workspace
+    # dir), NOT unrestricted — see tools/fs_sandbox.py:default_allowed_dirs.
+    filesystem_allowed_dirs: str = ""
 
 
 @dataclass
