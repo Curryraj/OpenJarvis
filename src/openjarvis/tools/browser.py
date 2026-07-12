@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import base64
-from typing import Any
+import queue
+import threading
+from concurrent.futures import Future
+from typing import Any, Callable
 
 from openjarvis.core.registry import ToolRegistry
 from openjarvis.core.types import ToolResult
@@ -11,16 +14,40 @@ from openjarvis.tools._stubs import BaseTool, ToolSpec
 
 
 class _BrowserSession:
-    """Manages a shared Playwright browser session (lazy init)."""
+    """Manages a shared Playwright browser session (lazy init).
+
+    Playwright's sync API is thread-affine: a browser/page must be driven
+    from the same OS thread that created it. ``ToolExecutor`` dispatches
+    each tool call on a fresh short-lived thread, so touching ``page``
+    directly from the caller's thread breaks on the second call ("cannot
+    switch to a different thread"). Instead, all Playwright interaction is
+    routed through one persistent worker thread owned by this session via
+    :meth:`run`.
+    """
 
     def __init__(self) -> None:
         self._playwright = None
         self._browser = None
         self._page = None
+        self._thread: threading.Thread | None = None
+        self._queue: "queue.Queue[tuple[Callable[[Any], Any], Future] | None]" = (
+            queue.Queue()
+        )
 
-    def _ensure_browser(self) -> None:
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            fn, future = item
+            try:
+                future.set_result(fn(self._ensure_page()))
+            except BaseException as exc:  # noqa: BLE001 - propagate to caller
+                future.set_exception(exc)
+
+    def _ensure_page(self):
         if self._page is not None:
-            return
+            return self._page
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -30,17 +57,31 @@ class _BrowserSession:
         self._playwright = sync_playwright().start()
         self._browser = self._playwright.chromium.launch(headless=True)
         self._page = self._browser.new_page()
-
-    @property
-    def page(self):
-        self._ensure_browser()
         return self._page
 
+    def run(self, fn: Callable[[Any], Any]) -> Any:
+        """Run ``fn(page)`` on this session's dedicated browser thread and
+        block for the result, re-raising any exception in the caller."""
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._worker, daemon=True)
+            self._thread.start()
+        future: Future = Future()
+        self._queue.put((fn, future))
+        return future.result()
+
     def close(self) -> None:
-        if self._browser:
-            self._browser.close()
-        if self._playwright:
-            self._playwright.stop()
+        if self._thread is not None and self._thread.is_alive():
+            def _shutdown(_page: Any) -> None:
+                if self._browser:
+                    self._browser.close()
+                if self._playwright:
+                    self._playwright.stop()
+
+            try:
+                self.run(_shutdown)
+            except Exception:
+                pass
+            self._queue.put(None)
         self._playwright = self._browser = self._page = None
 
 
@@ -115,10 +156,11 @@ class BrowserNavigateTool(BaseTool):
             )
 
         try:
-            page = _session.page
-            response = page.goto(url, wait_until=wait_for)
-            title = page.title()
-            text_content = page.inner_text("body")
+            def _do(page: Any) -> tuple[Any, str, str]:
+                response = page.goto(url, wait_until=wait_for)
+                return response, page.title(), page.inner_text("body")
+
+            response, title, text_content = _session.run(_do)
             if len(text_content) > 5000:
                 text_content = text_content[:5000] + "\n\n[Content truncated]"
 
@@ -197,11 +239,13 @@ class BrowserClickTool(BaseTool):
         by_text = params.get("by_text", False)
 
         try:
-            page = _session.page
-            if by_text:
-                page.get_by_text(selector).click()
-            else:
-                page.click(selector)
+            def _do(page: Any) -> None:
+                if by_text:
+                    page.get_by_text(selector).click()
+                else:
+                    page.click(selector)
+
+            _session.run(_do)
 
             return ToolResult(
                 tool_name="browser_click",
@@ -288,11 +332,13 @@ class BrowserTypeTool(BaseTool):
         clear = params.get("clear", True)
 
         try:
-            page = _session.page
-            if clear:
-                page.fill(selector, text)
-            else:
-                page.type(selector, text)
+            def _do(page: Any) -> None:
+                if clear:
+                    page.fill(selector, text)
+                else:
+                    page.type(selector, text)
+
+            _session.run(_do)
 
             return ToolResult(
                 tool_name="browser_type",
@@ -359,8 +405,9 @@ class BrowserScreenshotTool(BaseTool):
         full_page = params.get("full_page", False)
 
         try:
-            page = _session.page
-            screenshot_bytes = page.screenshot(full_page=full_page)
+            screenshot_bytes = _session.run(
+                lambda page: page.screenshot(full_page=full_page)
+            )
 
             if path:
                 with open(path, "wb") as f:
@@ -452,10 +499,26 @@ class BrowserExtractTool(BaseTool):
             )
 
         try:
-            page = _session.page
+            def _do(page: Any) -> Any:
+                if extract_type == "text":
+                    return page.inner_text(selector)
+                if extract_type == "links":
+                    return page.eval_on_selector_all(
+                        f"{selector} a[href]",
+                        """elements => elements.map(el => ({
+                            href: el.href,
+                            text: el.innerText.trim()
+                        }))""",
+                    )
+                return page.eval_on_selector_all(
+                    f"{selector} table",
+                    """elements => elements.map(el => el.innerText)""",
+                )
+
+            raw = _session.run(_do)
 
             if extract_type == "text":
-                content = page.inner_text(selector)
+                content = raw
                 if len(content) > 10000:
                     content = content[:10000] + "\n\n[Content truncated]"
                 return ToolResult(
@@ -466,13 +529,7 @@ class BrowserExtractTool(BaseTool):
                 )
 
             elif extract_type == "links":
-                links = page.eval_on_selector_all(
-                    f"{selector} a[href]",
-                    """elements => elements.map(el => ({
-                        href: el.href,
-                        text: el.innerText.trim()
-                    }))""",
-                )
+                links = raw
                 lines = []
                 for link in links:
                     text = link.get("text", "")
@@ -493,10 +550,7 @@ class BrowserExtractTool(BaseTool):
                 )
 
             else:  # tables
-                tables_text = page.eval_on_selector_all(
-                    f"{selector} table",
-                    """elements => elements.map(el => el.innerText)""",
-                )
+                tables_text = raw
                 if tables_text:
                     content = "\n\n---\n\n".join(tables_text)
                 else:

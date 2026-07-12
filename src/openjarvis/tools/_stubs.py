@@ -117,6 +117,30 @@ class ToolExecutor:
         self._agent_id = agent_id
         self._boundary_guard = boundary_guard
 
+    @staticmethod
+    def _parse_arguments(arguments: Any) -> Dict[str, Any]:
+        """Parse tool-call arguments, tolerating models that already pass a dict."""
+        if not arguments:
+            return {}
+        if isinstance(arguments, dict):
+            return arguments
+        return json.loads(arguments)
+
+    @staticmethod
+    def _filter_to_schema(params: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Drop keys not declared in the tool's JSON-schema ``properties``.
+
+        Small local models occasionally hallucinate extra/incorrect
+        parameter names alongside valid ones; passing those through causes
+        instant local failures (unexpected kwargs) or remote schema
+        rejections. If a tool declares no schema, params pass through
+        unfiltered.
+        """
+        properties = schema.get("properties") if isinstance(schema, dict) else None
+        if not properties or not isinstance(params, dict):
+            return params
+        return {k: v for k, v in params.items() if k in properties}
+
     def execute(self, tool_call: ToolCall) -> ToolResult:
         """Parse arguments, dispatch to tool, measure latency, emit events."""
         tool = self._tools.get(tool_call.name)
@@ -129,20 +153,22 @@ class ToolExecutor:
 
         # Parse arguments
         try:
-            params = json.loads(tool_call.arguments) if tool_call.arguments else {}
+            params = self._parse_arguments(tool_call.arguments)
         except json.JSONDecodeError as exc:
             return ToolResult(
                 tool_name=tool_call.name,
                 content=f"Invalid arguments JSON: {exc}",
                 success=False,
             )
+        params = self._filter_to_schema(params, tool.spec.parameters)
 
         # Boundary guard: scan external tool arguments
         if self._boundary_guard is not None and not getattr(tool, "is_local", True):
             try:
                 tool_call = self._boundary_guard.check_outbound(tool_call)
                 # Re-parse arguments after potential redaction
-                params = json.loads(tool_call.arguments) if tool_call.arguments else {}
+                params = self._parse_arguments(tool_call.arguments)
+                params = self._filter_to_schema(params, tool.spec.parameters)
             except Exception as exc:
                 return ToolResult(
                     tool_name=tool_call.name,
