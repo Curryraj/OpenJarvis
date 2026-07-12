@@ -42,15 +42,23 @@ class CodeInterpreterTool(BaseTool):
         return ToolSpec(
             name="code_interpreter",
             description=(
-                "Execute Python code and return the output."
-                " Code runs in an isolated subprocess."
+                "Execute Python code in an isolated subprocess and return"
+                " its stdout. This is a plain script runner, NOT a"
+                " REPL/notebook: the value of the last expression is NOT"
+                " auto-printed. You MUST call print(...) on anything you"
+                " want to see in the result, or the tool returns"
+                " '(no output)' even if the code ran successfully."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "Python code to execute.",
+                        "description": (
+                            "Python code to execute. Must include explicit"
+                            " print(...) calls for any value you need to see"
+                            " — nothing is auto-printed."
+                        ),
                     },
                 },
                 "required": ["code"],
