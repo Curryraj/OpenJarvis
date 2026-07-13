@@ -6,7 +6,9 @@ vectors.  Requires ``faiss-cpu`` (or ``faiss-gpu``) and ``numpy``.
 
 from __future__ import annotations
 
+import json
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
@@ -18,6 +20,7 @@ except ImportError as _faiss_exc:
     ) from _faiss_exc
 
 from openjarvis.core.events import EventType, get_event_bus
+from openjarvis.core.paths import get_config_dir
 from openjarvis.core.registry import MemoryRegistry
 from openjarvis.tools.storage._stubs import MemoryBackend, RetrievalResult
 from openjarvis.tools.storage.embeddings import (
@@ -41,14 +44,73 @@ class FAISSMemory(MemoryBackend):
         self,
         *,
         embedder: Embedder | None = None,
+        persist_dir: str | Path | None = None,
+        db_path: str | Path | None = None,
+        **_kwargs: Any,
     ) -> None:
+        # ``db_path`` (and any other kwargs) are accepted for call-site
+        # compatibility — the registry / server pass the sqlite-oriented
+        # ``db_path``. FAISS persists to a *fixed* pair of files under the
+        # config dir instead, so the CLI ``index`` process and the server's
+        # backend share one on-disk store regardless of that argument.
         if embedder is None:
             embedder = SentenceTransformerEmbedder()
         self._embedder = embedder
+        base = Path(persist_dir) if persist_dir else get_config_dir()
+        self._index_path = base / "faiss_index.faiss"
+        self._docs_path = base / "faiss_index.docs.json"
+        self._db_path = self._index_path  # surfaced by ``memory stats``
         self._index = faiss.IndexFlatIP(self._embedder.dim())
         self._documents: Dict[str, Tuple[str, str, Dict[str, Any]]] = {}
         self._id_map: List[str] = []
         self._deleted: Set[str] = set()
+        self._load()
+
+    def _load(self) -> None:
+        """Restore a previously persisted index + document store, if present."""
+        if not (self._index_path.exists() and self._docs_path.exists()):
+            return
+        try:
+            index = faiss.read_index(str(self._index_path))
+            with open(self._docs_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except (OSError, ValueError, RuntimeError):
+            return  # corrupt/unreadable — start fresh rather than crash
+        # Guard against embedder/dimension drift between runs.
+        if index.d != self._embedder.dim():
+            return
+        self._index = index
+        self._documents = {
+            doc_id: (rec["content"], rec["source"], rec["metadata"])
+            for doc_id, rec in payload.get("documents", {}).items()
+        }
+        self._id_map = list(payload.get("id_map", []))
+        self._deleted = set(payload.get("deleted", []))
+
+    def save(self) -> None:
+        """Persist the index + document store to disk (atomic sidecar write)."""
+        self._index_path.parent.mkdir(parents=True, exist_ok=True)
+        faiss.write_index(self._index, str(self._index_path))
+        payload = {
+            "documents": {
+                doc_id: {"content": c, "source": s, "metadata": m}
+                for doc_id, (c, s, m) in self._documents.items()
+            },
+            "id_map": self._id_map,
+            "deleted": sorted(self._deleted),
+        }
+        tmp = self._docs_path.with_suffix(self._docs_path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        tmp.replace(self._docs_path)
+
+    def close(self) -> None:
+        """Flush to disk. Called by the CLI in a ``finally`` after indexing."""
+        self.save()
+
+    def count(self) -> int:
+        """Live (non-deleted) document count — surfaced by ``memory stats``."""
+        return len(self._documents) - len(self._deleted)
 
     # ------------------------------------------------------------------
     # MemoryBackend interface
@@ -151,11 +213,16 @@ class FAISSMemory(MemoryBackend):
         return True
 
     def clear(self) -> None:
-        """Reset the index and all internal storage."""
+        """Reset the index and all internal storage, including on disk."""
         self._index.reset()
         self._documents.clear()
         self._id_map.clear()
         self._deleted.clear()
+        for p in (self._index_path, self._docs_path):
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
 
 __all__ = ["FAISSMemory"]
