@@ -1,4 +1,4 @@
-import type { ModelInfo, SavingsData, ServerInfo } from '../types';
+import type { ModelInfo, SavingsData, ServerInfo, VaultStats } from '../types';
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from './supabase';
 
 // ---------------------------------------------------------------------------
@@ -242,6 +242,12 @@ export async function preloadModel(modelName: string): Promise<void> {
 export async function fetchSavings(): Promise<SavingsData> {
   const res = await apiFetch(`/v1/savings`);
   if (!res.ok) throw new Error(`Failed to fetch savings: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchVaultStats(): Promise<VaultStats> {
+  const res = await apiFetch(`/v1/vault/stats`);
+  if (!res.ok) throw new Error(`Failed to fetch vault stats: ${res.status}`);
   return res.json();
 }
 

@@ -184,6 +184,12 @@ export interface SavingsData {
   token_counting_version?: number;
 }
 
+export interface VaultStats {
+  node_count: number;
+  domain_count: number;
+  last_updated: string | null;
+}
+
 export interface ServerInfo {
   model: string;
   agent: string | null;
