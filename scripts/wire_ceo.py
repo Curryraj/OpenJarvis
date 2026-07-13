@@ -9,6 +9,22 @@ the model's input every tick (summary_memory only surfaces as a truncated
 
 Re-run any time the roster changes to refresh the instruction text.
 """
+import sys
+
+# Standalone scripts don't go through cli.main()'s Windows console setup, so
+# stdout/stderr stay on the OS default codepage (cp1252 here) instead of
+# UTF-8. That only corrupts what gets *printed* below (e.g. non-ASCII roster
+# text) -- it never touches what's written to agents.db, since AgentManager
+# writes through sqlite3/json, not through this stream. Reconfiguring avoids
+# printing mojibake that looks like real data corruption but isn't.
+if sys.platform == "win32":
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, OSError):
+                pass
+
 from openjarvis.agents.manager import AgentManager
 from openjarvis.core.config import load_config
 from openjarvis.core.paths import get_config_dir
