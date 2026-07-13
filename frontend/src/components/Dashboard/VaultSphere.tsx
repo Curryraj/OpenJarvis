@@ -35,6 +35,7 @@ export function VaultSphere() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const particlesRef = useRef<Particle[]>(makeParticles(IDLE_PARTICLE_COUNT));
   const rotationRef = useRef(0);
+  const prefersReducedMotionRef = useRef(window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
   const nodeCount = vaultStats?.node_count ?? 0;
 
@@ -48,7 +49,14 @@ export function VaultSphere() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const mediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    prefersReducedMotionRef.current = mediaQuery.matches;
+
+    const handleMediaQueryChange = (e: MediaQueryListEvent) => {
+      prefersReducedMotionRef.current = e.matches;
+    };
+
+    mediaQuery.addEventListener('change', handleMediaQueryChange);
 
     const styles = getComputedStyle(canvas);
     const accentColor = styles.getPropertyValue('--color-accent').trim() || '#c026d3';
@@ -87,14 +95,17 @@ export function VaultSphere() {
       }
       ctx.globalAlpha = 1;
 
-      if (!prefersReducedMotion) {
+      if (!prefersReducedMotionRef.current) {
         rotationRef.current += 0.0015;
       }
       frameId = requestAnimationFrame(render);
     };
 
     frameId = requestAnimationFrame(render);
-    return () => cancelAnimationFrame(frameId);
+    return () => {
+      cancelAnimationFrame(frameId);
+      mediaQuery.removeEventListener('change', handleMediaQueryChange);
+    };
   }, []);
 
   return (
