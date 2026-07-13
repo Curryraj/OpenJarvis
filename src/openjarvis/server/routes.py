@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -1049,6 +1050,25 @@ async def savings(request: Request):
         return savings_to_dict(result)
     finally:
         agg.close()
+
+
+@router.get("/v1/vault/stats")
+async def vault_stats():
+    """Return node/domain counts for the dashboard's Vault Sphere panel.
+
+    Reads the graphify graph.json path from OPENJARVIS_VAULT_GRAPH_PATH.
+    Unset or missing/malformed file both resolve to zeroed stats rather
+    than an error — the panel has its own idle empty-state for this.
+    """
+    import os
+
+    from openjarvis.server.vault_stats import compute_vault_stats
+
+    graph_path_str = os.environ.get("OPENJARVIS_VAULT_GRAPH_PATH")
+    if not graph_path_str:
+        return {"node_count": 0, "domain_count": 0, "last_updated": None}
+
+    return compute_vault_stats(Path(graph_path_str))
 
 
 @router.post("/v1/telemetry/reset")
