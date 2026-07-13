@@ -61,3 +61,28 @@ class TestComputeVaultStats:
         graph_path.write_text("not valid json", encoding="utf-8")
         result = compute_vault_stats(graph_path)
         assert result == {"node_count": 0, "domain_count": 0, "last_updated": None}
+
+    def test_explicit_none_community_name_falls_back_to_community_id(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: when community_name is explicitly None, fall back to community.
+
+        Previously, dict.get(key, default) would return None when the key exists but has
+        a None value, instead of falling back to the default. This test creates a scenario
+        where multiple nodes have explicit null community_name with different community IDs,
+        ensuring all community IDs are counted (not collapsed into None).
+        """
+        graph_path = _write_graph(
+            tmp_path,
+            [
+                {"id": "a", "community_name": None, "community": 1},
+                {"id": "b", "community_name": "Domain1", "community": 2},
+                {"id": "c", "community_name": None, "community": 3},
+            ],
+        )
+        result = compute_vault_stats(graph_path)
+        assert result["node_count"] == 3
+        # Should count domain_count as 3: community IDs 1 and 3 (from fallback),
+        # plus "Domain1" (from community_name).
+        # With the bug, would count as 2 (None and "Domain1").
+        assert result["domain_count"] == 3

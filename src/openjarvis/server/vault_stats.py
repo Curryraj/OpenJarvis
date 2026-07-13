@@ -37,7 +37,7 @@ def compute_vault_stats(graph_path: Path) -> VaultStats:
         return dict(_ZERO_STATS)
 
     domains = {
-        node.get("community_name", node.get("community"))
+        (node.get("community_name") if node.get("community_name") is not None else node.get("community"))
         for node in nodes
         if isinstance(node, dict)
         and (node.get("community_name") is not None or node.get("community") is not None)
