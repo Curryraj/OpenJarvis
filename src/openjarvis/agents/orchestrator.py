@@ -23,6 +23,36 @@ from openjarvis.core.types import Message, Role, ToolCall, ToolResult
 from openjarvis.engine._stubs import InferenceEngine
 from openjarvis.tools._stubs import BaseTool
 
+# Small local models (e.g. qwen2.5:7b via Ollama) sometimes emit a promissory
+# sentence -- "Let me calculate that for you." -- as a complete generation
+# (finish_reason="stop", no tool_calls) instead of either answering or
+# calling a tool. Reproduced: ~50% of the time on ambiguous prompts the model
+# stops right after announcing intent. A single nudge-and-retry resolved it
+# 6/6 in testing, so this is treated as one bounded extra turn, not a
+# separate continuation budget.
+#
+# Anchored to the END of the (stripped) content: the signal isn't "mentions
+# a promissory phrase" (a complete answer can legitimately open with "Let me
+# calculate that for you: ..." followed by the real answer) -- it's "the
+# response stopped right after announcing intent, with nothing after it".
+_STALL_RE = re.compile(
+    r"(?:let me (?:calculate|check|do|find|look|compute|figure|work)\b[^.!?\n]*"
+    r"|i(?:'ll| will) (?:calculate|check|do|find|look|compute|figure|get|work)\b[^.!?\n]*"
+    r"|give me a (?:moment|second|sec)"
+    r"|working on it"
+    r"|one moment)"
+    r"[.!]?\s*\Z",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_stall(content: str) -> bool:
+    """True if *content* ends by announcing work it hasn't actually done."""
+    stripped = content.strip()
+    if not stripped:
+        return False
+    return bool(_STALL_RE.search(stripped))
+
 
 @AgentRegistry.register("orchestrator")
 class OrchestratorAgent(ToolUsingAgent):
@@ -214,7 +244,7 @@ class OrchestratorAgent(ToolUsingAgent):
         self._emit_turn_start(input)
 
         # Build initial messages
-        messages = self._build_messages(input, context)
+        messages = self._build_messages(input, context, system_prompt=self._system_prompt)
 
         # Get OpenAI-format tool definitions
         openai_tools = self._executor.get_openai_tools() if self._tools else []
@@ -223,6 +253,7 @@ class OrchestratorAgent(ToolUsingAgent):
         turns = 0
         total_prompt_tokens = 0
         total_completion_tokens = 0
+        stall_nudges = 0
 
         for _turn in range(self._max_turns):
             turns += 1
@@ -249,6 +280,23 @@ class OrchestratorAgent(ToolUsingAgent):
             if not raw_tool_calls:
                 content = self._check_continuation(result, messages)
                 content = self._strip_think_tags(content)
+
+                if stall_nudges < 1 and _looks_like_stall(content):
+                    stall_nudges += 1
+                    messages.append(Message(role=Role.ASSISTANT, content=content))
+                    messages.append(
+                        Message(
+                            role=Role.USER,
+                            content=(
+                                "You said you would do that, but the response "
+                                "stopped there. Either give the complete final "
+                                "answer right now, or call the appropriate "
+                                "tool. Do not just restate intent."
+                            ),
+                        )
+                    )
+                    continue
+
                 self._emit_turn_end(turns=turns, content_length=len(content))
                 return AgentResult(
                     content=content,

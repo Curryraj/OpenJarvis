@@ -5,7 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from openjarvis.agents._stubs import AgentContext
-from openjarvis.agents.orchestrator import OrchestratorAgent
+from openjarvis.agents.orchestrator import OrchestratorAgent, _looks_like_stall
 from openjarvis.core.events import EventBus, EventType
 from openjarvis.core.types import Conversation, Message, Role, ToolResult
 from openjarvis.tools._stubs import BaseTool, ToolSpec
@@ -136,6 +136,18 @@ def _make_engine_multi_tool() -> MagicMock:
         },
     ]
     return engine
+
+
+def _stall_response(content: str = "Let me calculate that for you.") -> dict:
+    """A complete (finish_reason=stop) generation with no tool_calls that
+    only announces intent -- reproduces the qwen2.5:7b stall behavior."""
+    return {
+        "content": content,
+        "tool_calls": None,
+        "usage": {"prompt_tokens": 5, "completion_tokens": 8, "total_tokens": 13},
+        "model": "test-model",
+        "finish_reason": "stop",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -665,3 +677,112 @@ class TestOrchestratorParallelTools:
         )
         result = agent.run("What is 2+2?")
         assert result.content == "The answer is 4."
+
+
+class TestOrchestratorStallDetection:
+    """qwen2.5:7b sometimes emits a promissory sentence ("Let me calculate
+    that for you.") as a complete generation (finish_reason=stop, no
+    tool_calls) instead of answering or calling a tool. The orchestrator
+    should nudge once and retry rather than returning the stall as final."""
+
+    def test_looks_like_stall_detects_promissory_phrases(self):
+        assert _looks_like_stall("Let me calculate that for you.")
+        assert _looks_like_stall("Sure, I can calculate that for you. Let me do that now.")
+        assert _looks_like_stall("I'll check that for you now.")
+        assert _looks_like_stall("One moment.")
+
+    def test_looks_like_stall_ignores_real_answers(self):
+        assert not _looks_like_stall("Paris is the capital of France.")
+        assert not _looks_like_stall("The sum of 47 and 89 is 136.")
+        assert not _looks_like_stall("")
+
+    def test_looks_like_stall_ignores_answers_that_open_with_a_stall_phrase(self):
+        """A response that opens like a stall but goes on to contain the
+        actual answer should not be flagged -- the check is anchored to the
+        END of the content (nothing followed the promise), not "mentions a
+        promissory phrase anywhere"."""
+        content_with_real_answer = (
+            "Let me calculate that for you. The first 10 Fibonacci numbers "
+            "are 0, 1, 1, 2, 3, 5, 8, 13, 21, 34, which sum to 88."
+        )
+        assert not _looks_like_stall(content_with_real_answer)
+
+    def test_stall_then_final_answer_nudges_once(self):
+        """First turn stalls, nudge is injected, second turn answers -> 2 turns."""
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.side_effect = [
+            _stall_response("Let me calculate that for you."),
+            {
+                "content": "The sum of the first 10 Fibonacci numbers is 88.",
+                "tool_calls": None,
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 10,
+                    "total_tokens": 30,
+                },
+                "model": "test-model",
+                "finish_reason": "stop",
+            },
+        ]
+        agent = OrchestratorAgent(engine, "test-model")
+        result = agent.run("What's the sum of the first 10 Fibonacci numbers?")
+        assert result.content == "The sum of the first 10 Fibonacci numbers is 88."
+        assert result.turns == 2
+        # Second call's messages must include the nudge, proving it actually
+        # retried rather than coincidentally matching a second engine call.
+        second_call_messages = engine.generate.call_args_list[1][0][0]
+        nudge_texts = [
+            m.content for m in second_call_messages if m.role == Role.USER
+        ]
+        assert any("restate intent" in t.lower() for t in nudge_texts)
+
+    def test_stall_then_tool_call_nudges_once(self):
+        """Stall on turn 1, delegate on turn 2, final answer on turn 3."""
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.side_effect = [
+            _stall_response("Let me look into that for you."),
+            {
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "name": "calculator", "arguments": '{"expression":"2+2"}'}
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
+                "model": "test-model",
+                "finish_reason": "tool_calls",
+            },
+            {
+                "content": "The answer is 4.",
+                "tool_calls": None,
+                "usage": {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20},
+                "model": "test-model",
+                "finish_reason": "stop",
+            },
+        ]
+        agent = OrchestratorAgent(engine, "test-model", tools=[_CalculatorStub()])
+        result = agent.run("What is 2+2?")
+        assert result.content == "The answer is 4."
+        assert result.turns == 3
+        assert len(result.tool_results) == 1
+
+    def test_stall_nudged_only_once_then_returns_stall(self):
+        """If the model keeps stalling even after the nudge, give up after
+        one retry rather than looping — return whatever it said."""
+        engine = MagicMock()
+        engine.engine_id = "mock"
+        engine.generate.return_value = _stall_response("Let me check that for you.")
+        agent = OrchestratorAgent(engine, "test-model", max_turns=10)
+        result = agent.run("What is 2+2?")
+        assert result.content == "Let me check that for you."
+        assert result.turns == 2
+        assert engine.generate.call_count == 2
+
+    def test_no_stall_no_nudge_single_turn(self):
+        """A normal short direct answer is returned immediately, no nudge."""
+        engine = _make_engine_no_tools("Paris is the capital of France.")
+        agent = OrchestratorAgent(engine, "test-model")
+        result = agent.run("What's the capital of France?")
+        assert result.content == "Paris is the capital of France."
+        assert result.turns == 1
+        assert engine.generate.call_count == 1

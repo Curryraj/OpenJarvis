@@ -354,8 +354,23 @@ class AgentExecutor:
 
         # Construct agent instance
         agent_kwargs: dict[str, Any] = {}
+        # ``instruction`` (an agent's standing role/task text, e.g. CEO's
+        # "You are the CEO, you delegate...") used to be embedded as plain
+        # text inside the USER turn below ("Standing instruction: ...").
+        # Reproduced: with tools attached, qwen2.5:7b/Ollama's function-
+        # calling template returns a genuinely empty message (no content,
+        # no tool_calls, ~30 "silently discarded" completion tokens) 100% of
+        # the time when instructional text lives in the user turn, vs. 0%
+        # when the identical text is a proper system message. Route it
+        # through system_prompt instead; input_text below only carries the
+        # date/tick-note/pending-message scaffolding now.
+        instruction = config.get("instruction", "")
         sys_prompt = config.get("system_prompt")
-        if sys_prompt is not None:
+        if instruction and sys_prompt:
+            agent_kwargs["system_prompt"] = f"{sys_prompt}\n\n{instruction}"
+        elif instruction:
+            agent_kwargs["system_prompt"] = instruction
+        elif sys_prompt is not None:
             agent_kwargs["system_prompt"] = sys_prompt
         if getattr(agent_cls, "accepts_tools", False) and tool_instances:
             agent_kwargs["tools"] = tool_instances
@@ -439,7 +454,9 @@ class AgentExecutor:
             agent_cls.__name__,
         )
 
-        # Build input from instruction + summary_memory + pending messages.
+        # Build input from summary_memory + pending messages. ``instruction``
+        # was already routed into agent_kwargs["system_prompt"] above, not
+        # restated here.
         # NB: we deliberately do NOT inject the full previous response back
         # in as "Previous context" — that caused the model to parrot its
         # own prior output verbatim. Cross-tick continuity now lives in the
@@ -449,7 +466,6 @@ class AgentExecutor:
         import re
 
         today = datetime.date.today().strftime("%A, %B %d, %Y")
-        instruction = config.get("instruction", "")
         memory = (agent.get("summary_memory") or "").strip()
         last_run_at = agent.get("last_run_at")
 
@@ -465,13 +481,8 @@ class AgentExecutor:
             else:
                 tick_note = f"Previous tick: {first_sentence}"
 
-        if instruction:
-            input_text = f"Current date: {today}\n\nStanding instruction: {instruction}"
-            if tick_note:
-                input_text += f"\n\n{tick_note}"
-        else:
-            base = tick_note or "Continue your assigned task."
-            input_text = f"Current date: {today}\n\n{base}"
+        base = tick_note or "Continue your assigned task."
+        input_text = f"Current date: {today}\n\n{base}"
         pending = self._manager.get_pending_messages(agent["id"])
         if pending:
             user_msgs = "\n".join(f"User: {m['content']}" for m in pending)
