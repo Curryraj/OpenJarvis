@@ -13,6 +13,7 @@ import type {
   StreamState,
   ToolCallInfo,
   TokenUsage,
+  VaultStats,
 } from '../types';
 import type { ManagedAgent } from './api';
 
@@ -130,6 +131,7 @@ interface AppState {
   selectedModel: string;
   serverInfo: ServerInfo | null;
   savings: SavingsData | null;
+  vaultStats: VaultStats | null;
 
   // Settings
   settings: Settings;
@@ -182,6 +184,7 @@ interface AppState {
   setSelectedModel: (model: string) => void;
   setServerInfo: (info: ServerInfo | null) => void;
   setSavings: (data: SavingsData | null) => void;
+  setVaultStats: (data: VaultStats | null) => void;
   incrementSavings: (usage: TokenUsage) => void;
 
   // Live GPU metrics — streamed from /api/research system_metrics events.
@@ -254,6 +257,7 @@ export const useAppStore = create<AppState>((set, get) => {
     selectedModel: '',
     serverInfo: null,
     savings: null,
+    vaultStats: null,
 
     settings: loadSettings(),
 
@@ -453,6 +457,7 @@ export const useAppStore = create<AppState>((set, get) => {
     setSelectedModel: (model: string) => set({ selectedModel: model }),
     setServerInfo: (info: ServerInfo | null) => set({ serverInfo: info }),
     setSavings: (data: SavingsData | null) => set({ savings: data }),
+    setVaultStats: (data: VaultStats | null) => set({ vaultStats: data }),
     incrementSavings: (usage: TokenUsage) => {
       const cur = get().savings;
       const prompt = usage.prompt_tokens ?? 0;
