@@ -355,7 +355,16 @@ def _format_tool_args(args) -> str:
     return ", ".join(f"{k}={str(v)[:40]}" for k, v in list(args.items())[:2])
 
 
-def _run_tick_with_live_trace(executor, agent_id: str, console: Console) -> None:
+def _format_tool_result(result) -> str:
+    """Compact one-line rendering of a tool's result content for the live trace."""
+    if not result:
+        return ""
+    return str(result).replace("\n", " ")[:80]
+
+
+def _run_tick_with_live_trace(
+    executor, agent_id: str, console: Console, verbose: bool = False
+) -> None:
     """Run one tick synchronously, streaming progress to *console*.
 
     Mirrors the Deep Research live trace: subscribe to the executor's
@@ -382,6 +391,10 @@ def _run_tick_with_live_trace(executor, agent_id: str, console: Console) -> None
             return
         mark = "[green]✓[/green]" if event.data.get("success", True) else "[red]✗[/red]"
         console.print(f"    {mark} [dim]{event.data.get('latency', 0.0):.1f}s[/dim]")
+        if verbose:
+            resultstr = _format_tool_result(event.data.get("result"))
+            if resultstr:
+                console.print(f"      [dim italic]{resultstr}[/dim italic]")
 
     def on_inference_start(_event) -> None:
         console.print("  [dim]· thinking…[/dim]")
@@ -821,7 +834,14 @@ def errors():
     "Default: on (suits non-interactive CLI use). Pass --no-yes to require a "
     "TTY prompt for tools whose ToolSpec sets requires_confirmation=True.",
 )
-def ask(agent_id, message, auto_approve):
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help="Show a truncated preview of each tool's result content in the live trace.",
+)
+def ask(agent_id, message, auto_approve, verbose):
     """Ask an agent a question (immediate response)."""
     manager = _get_manager()
     agent_id = _resolve_agent_id(manager, agent_id)
@@ -845,7 +865,7 @@ def ask(agent_id, message, auto_approve):
     # Run the tick with a live trace rather than blocking in silence — the
     # message we just queued is consumed as this tick's input, so the user
     # sees the agent's searches/tool calls instead of an apparent hang.
-    _run_tick_with_live_trace(executor, agent_id, console)
+    _run_tick_with_live_trace(executor, agent_id, console, verbose=verbose)
     msgs = manager.list_messages(agent_id)
     # list_messages returns newest-first, so responses[0] is this tick's reply.
     responses = [m for m in msgs if m["direction"] == "agent_to_user"]
