@@ -14,7 +14,7 @@ _All run on your local model (qwen2.5:7b). No cloud._
 | **Researcher** | `deep_research` | Digs your notes + the live web, writes a researched summary. | **Playwright browser** (navigate, snapshot, click, find, screenshot) + `memory_search` | idle — verified reliable across multiple runs |
 | **Coder** | `orchestrator` | Writes, edits, and runs code. Sandboxed to the project dir + `~/.openjarvis/workspace/`. Note: **not** `native_react` — that type's regex-based Thought/Action parsing was unreliable with qwen2.5:7b in testing (silent hallucinated "success" with no tool call on ~1/4 runs); `orchestrator`'s native function-calling mode (same mechanism Researcher uses) was reliable across 3/3 verified runs. | `file_read`, `file_write`, `apply_patch`, `shell_exec`, `code_interpreter`, `repl`, `think`, `memory_search` | idle — verified: write, run, read-modify-write, `git status` via shell_exec, all correct |
 | **Assistant** | `simple` | Fast one-shot Q&A, no tools. | — | idle — verified |
-| **Monitor** | `monitor_operative` | Watches OpenJarvis's own git log for new commits since its last check, using `memory_store`/`memory_retrieve` for cross-run state. Re-verified 2026-07-13 after the instruction-routing fix: correctly reported the real current commit hash (`97be019`), no hallucination. **Known limitation (unchanged):** doesn't consistently call `memory_retrieve` first — sometimes re-reports already-seen commits as "new" instead of correctly diffing. Not chased further. | `shell_exec`, `memory_store`, `memory_retrieve`, `think` | idle — real-data reporting verified; stateful dedup unreliable |
+| **Monitor** | `monitor_operative` | Watches OpenJarvis's own git log for new commits since its last check. **Dedup fixed 2026-07-13** — see "Monitor dedup fix" below. Checkpoint is now a plain file (`~/.openjarvis/monitor_last_commit.txt`) + a real `git log <hash>..HEAD` range diff, not the shared FAISS store. | `shell_exec`, `think` | idle — dedup mechanism verified correct across 6 trials |
 
 ## Instruction routing fix (2026-07-13)
 
@@ -67,6 +67,44 @@ just no longer force-fed every turn). Coder already had `memory_search`; Monitor
 auto-inject with no replacement — matches its documented scope ("quick asks that do not need
 research"), no action taken.
 
+## Monitor dedup fix (2026-07-13)
+
+Root cause of "sometimes re-reports already-seen commits as new" was structural, not a small-model
+quirk: Monitor's checkpoint was written via `memory_store`/read via `memory_retrieve` — i.e. the
+shared semantic FAISS store. Two independent problems there: (1) the daily `OpenJarvis-Refresh`
+scheduled task (07:45) does `FAISSMemory().clear()` then rebuilds from curated markdown + captured
+auto-facts ONLY — Monitor's raw checkpoint documents are neither, so **every single day's refresh
+silently deleted Monitor's checkpoint**. (2) Even without the wipe, `memory_retrieve("Monitor last
+checked commit")` is a semantic-similarity search across the whole shared store (174+ docs) — tested
+directly, it never once surfaced Monitor's own stored checkpoint text, not even querying the literal
+commit hash; it returned unrelated Obsidian notes instead. A vector store is the wrong data structure
+for exact per-agent state.
+
+**Fix:** Monitor's instruction now uses `shell_exec` (already granted) for a 4-step file-based
+checkpoint instead: (1) read `~/.openjarvis/monitor_last_commit.txt` (or detect first-run via a
+`NONE` sentinel), (2) `git log <hash>..HEAD --oneline` for a real, exact git range diff instead of
+asking the model to eyeball-compare two lists, (3) summarize only if non-empty, (4) always write the
+current `git log -1 --format=%H` back to the checkpoint file. Dropped `memory_store`/`memory_retrieve`
+from its tools — no longer needed, and a smaller tool list is one less thing to mis-route on.
+`memory_search`/`memory_retrieve` were never inherently unsuited to knowledge lookup — the bug was
+using them for exact single-value state, not knowledge retrieval.
+
+**Windows gotcha found+fixed along the way:** cmd.exe's `type` builtin rejects forward-slash paths
+("The syntax of the command is incorrect") but accepts backslash paths fine — verified directly
+before writing the final instruction, not guessed. Also confirmed `%USERPROFILE%` is unusable here:
+`shell_exec` runs with a minimal sanitized env (`PATH,HOME,USER,LANG,TERM` only) that doesn't include
+it — used the literal absolute path instead.
+
+**Verified:** the file-checkpoint mechanism itself is 100% correct in isolation (scripted, non-agent
+test: first-run detection, write, read-back, and range-diff against both a fresh and a stale hash all
+gave exactly the right answer). Driven through the real agent across 6 tick-pairs (first-run tick +
+immediate follow-up tick): 5/6 correctly recognized nothing was new; one tick skipped the checkpoint
+read and re-reported old commits (same class of small-model step-skipping seen elsewhere in this
+project, e.g. CEO's autonomous routing) — the mechanism didn't fail, the model occasionally doesn't
+follow it. Net: a deterministic, always-reproduced structural bug is now fixed; what's left is the
+same honest small-model reliability variance already documented for CEO, not something chased
+further tonight.
+
 ## CEO delegation (real, not a stub)
 
 `agent_spawn`/`agent_send` (tools/agent_tools.py) are an in-memory simulation — spawning
@@ -86,7 +124,7 @@ description. Re-run `scripts/wire_ceo.py` after adding/changing any agent to ref
 | ~~Researcher~~ | `deep_research` | ✅ **activated** — see the Active table above. |
 | ~~Coder~~ | `orchestrator` | ✅ **activated** — see note above on why `orchestrator`, not `native_react`. |
 | ~~Assistant~~ | `simple` | ✅ **activated** — see the Active table above. |
-| ~~Monitor~~ | `monitor_operative` | ✅ **activated** — see note above on the stateful-dedup limitation. |
+| ~~Monitor~~ | `monitor_operative` | ✅ **activated** — see "Monitor dedup fix" above. |
 | Briefer | `morning_digest` | Structured briefing (messages/calendar/world) — needs those sources wired. |
 
 _Advanced (research-grade, heavier — ignore for now): `toolorchestra`, `skillorchestra`, `conductor`, `archon`, `minions`, `react`, `operative`._
