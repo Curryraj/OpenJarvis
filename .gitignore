@@ -67,6 +67,9 @@ site/
 # Frontend
 frontend/node_modules/
 frontend/dist/
+# TypeScript incremental-build cache — regenerated on every build, so tracking
+# it makes `git status` dirty after any frontend build.
+*.tsbuildinfo
 
 # Desktop
 desktop/node_modules/
@@ -130,3 +133,7 @@ learning.db
 minion_logs/
 *.oj-debug.json
 oj-debug.*.json
+
+# Playwright MCP session artifacts — recreated whenever the Researcher agent's
+# browser tools run (see [tools.mcp] in ~/.openjarvis/config.toml).
+.playwright-mcp/
