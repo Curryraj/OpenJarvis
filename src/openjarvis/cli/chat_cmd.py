@@ -12,8 +12,10 @@ from rich.markdown import Markdown
 from openjarvis.cli._tool_names import resolve_tool_names
 from openjarvis.core.config import load_config
 from openjarvis.core.events import EventBus
-from openjarvis.core.types import Message, Role
+from openjarvis.core.registry import CompressionRegistry
+from openjarvis.core.types import Conversation, Message, Role
 from openjarvis.memory import publish_completed_exchange
+from openjarvis.sessions import compression as _compression  # noqa: F401 — trigger registration
 
 
 def _read_input(prompt: str = "You> ") -> Optional[str]:
@@ -22,6 +24,32 @@ def _read_input(prompt: str = "You> ") -> Optional[str]:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
         return None
+
+
+# A REPL with no cap resends the *entire* transcript every turn — each of N
+# turns re-processes all N-1 prior turns, so token cost and per-turn latency
+# grow ~O(n^2) over a long-running local session. Once history crosses this
+# many messages, compress the oldest half into a short summary so later
+# turns stay bounded instead of growing forever.
+_MAX_HISTORY_MESSAGES = 40
+_COMPRESSION_KEEP_RATIO = 0.5
+
+
+def _compress_history(history: List[Message]) -> List[Message]:
+    """Summarize the oldest half of turns once history grows past the cap.
+
+    Leaves a leading system message untouched — it's cheap and never
+    redundant to resend — and only compresses the conversational turns
+    that follow it.
+    """
+    if len(history) <= _MAX_HISTORY_MESSAGES:
+        return history
+    has_system = bool(history) and history[0].role == Role.SYSTEM
+    head = history[:1] if has_system else []
+    rest = history[1:] if has_system else history
+    compressor_cls = CompressionRegistry.get("session_consolidation")
+    compressed_rest = compressor_cls().compress(rest, _COMPRESSION_KEEP_RATIO)
+    return head + compressed_rest
 
 
 @click.command()
@@ -261,11 +289,26 @@ def chat(
 
         # Add user message
         history.append(Message(role=Role.USER, content=user_input))
+        history = _compress_history(history)
 
         # Generate response
         try:
             if agent is not None:
-                response = agent.run(user_input)
+                from openjarvis.agents import AgentContext
+
+                # Pass everything except the current user turn as prior
+                # context — agent.run() supplies the current turn itself via
+                # `input`, and the agent builds its own system prompt, so
+                # both the leading system message and the just-appended user
+                # turn would be duplicated if included here.
+                has_system = bool(history) and history[0].role == Role.SYSTEM
+                prior_turns = history[1:-1] if has_system else history[:-1]
+                response = agent.run(
+                    user_input,
+                    context=AgentContext(
+                        conversation=Conversation(messages=prior_turns)
+                    ),
+                )
                 content = (
                     response.content if hasattr(response, "content") else str(response)
                 )
