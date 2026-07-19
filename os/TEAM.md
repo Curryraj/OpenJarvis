@@ -153,6 +153,39 @@ invent a citation, separate vault claims from web claims, flag conflicting sourc
 changing two variables at once. Worth A/B testing later — a multi-step research agent may do
 better with thinking enabled.
 
+### Few-shot exemplars (2026-07-20)
+
+The prose rules above only half-worked: the *positive* ones landed (search unprompted, give
+concrete figures) while the *restraint* ones did not (still fired one broad search, still padded
+with soft-skill filler, never once said "I couldn't find X"). Typical for a 7b — showing beats
+telling. So two exemplars were added at `~/.openjarvis/agents/deep_research/few_shot.json`,
+loaded by the same `prompt_loader.py`.
+
+**How they're injected:** `deep_research.py` inserts each pair as plain USER/ASSISTANT messages
+immediately before the real user turn. There are **no tool-call traces** in that format, so
+few-shot here can only teach the *shape of the answer* — it cannot demonstrate "make three narrow
+searches instead of one". The single-broad-search habit needs a different lever.
+
+**The two exemplars are deliberately paired** on the same topic (UK public EV chargers):
+1. an answerable question → concrete figures first, named source, flags a real definitional
+   change that breaks comparisons, sources list, zero filler;
+2. a **deliberately unanswerable** one (a 2035 projection) → states plainly that no published
+   figure was found, names what was searched, gives the verified baseline instead, and explicitly
+   refuses to extrapolate a number that would look sourced but isn't.
+
+The pairing is the point: one question that should be answered and one that should not, so the
+model learns to *discriminate* rather than to always hedge or always assert.
+
+⚠️ **Staleness liability.** Exemplar content is injected on every Researcher turn, so any figure
+in it is a fact the model sees constantly and may parrot. Both exemplars therefore use **real,
+verified** numbers (119,080 UK public EV chargers at 2026-04-01, 27,372 rapid, 121,171 by end
+June — DfT via Zapmap) rather than plausible-looking invented ones. **These will go stale.** When
+they do, either refresh the figures or pick a topic that doesn't drift. Never put a made-up number
+in an exemplar.
+
+The EV topic was chosen because it is far from Jaiydaan's actual research subjects — if the model
+ever parrots an exemplar figure into an unrelated answer, it is obvious rather than camouflaged.
+
 ## Bench (available to activate)
 
 | Suggested name | Type | What it's good at |
