@@ -41,6 +41,16 @@ class WebSearchTool(BaseTool):
                         "type": "integer",
                         "description": "Maximum results to return.",
                     },
+                    "include_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Restrict results to these domains, e.g."
+                            ' ["gov.uk", "ons.gov.uk", "europa.eu"]. Use this'
+                            " for statistics, official reports and other"
+                            " primary sources, to avoid SEO-ranked blogs."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -115,11 +125,31 @@ class WebSearchTool(BaseTool):
             text = text[:max_chars] + "\n\n[Content truncated]"
         return text
 
-    def _duckduckgo_search(self, query: str, max_results: int) -> str:
+    @staticmethod
+    def _apply_domain_filter(query: str, include_domains: list[str] | None) -> str:
+        """Bias a DuckDuckGo query toward specific domains.
+
+        DDG has no structured domain parameter like Tavily's include_domains,
+        but it does honor the `site:` operator, and OR-ing several is the
+        documented way to allow more than one. Kept as a query rewrite so the
+        caller passes the same argument regardless of which engine serves it.
+        """
+        if not include_domains:
+            return query
+        clause = " OR ".join(f"site:{d.strip()}" for d in include_domains if d.strip())
+        return f"{query} ({clause})" if clause else query
+
+    def _duckduckgo_search(
+        self,
+        query: str,
+        max_results: int,
+        include_domains: list[str] | None = None,
+    ) -> str:
         """Search using DuckDuckGo as fallback."""
         from ddgs import DDGS
 
         ddgs = DDGS()
+        query = self._apply_domain_filter(query, include_domains)
         raw_results = list(ddgs.text(query, max_results=max_results))
         results = []
         for r in raw_results:
@@ -159,17 +189,27 @@ class WebSearchTool(BaseTool):
                 )
 
         max_results = params.get("max_results", self._max_results)
+        include_domains = params.get("include_domains") or None
+        if isinstance(include_domains, str):
+            # Small models sometimes emit a bare string or a comma-joined list
+            # instead of a JSON array; accept both rather than silently
+            # dropping the filter.
+            include_domains = [d for d in (
+                p.strip() for p in include_domains.split(",")
+            ) if d]
 
         try:
             from tavily import TavilyClient
 
             client = TavilyClient(api_key=self._api_key)
-            response = client.search(
-                query,
-                max_results=max_results,
-                search_depth="advanced",
-                include_usage=True,
-            )
+            search_kwargs: dict[str, Any] = {
+                "max_results": max_results,
+                "search_depth": "advanced",
+                "include_usage": True,
+            }
+            if include_domains:
+                search_kwargs["include_domains"] = include_domains
+            response = client.search(query, **search_kwargs)
             results = response.get("results", [])
             formatted_parts = []
             for r in results:
@@ -189,6 +229,7 @@ class WebSearchTool(BaseTool):
                     "num_results": len(results),
                     "engine": "tavily",
                     "credits": (response.get("usage") or {}).get("credits"),
+                    "include_domains": include_domains,
                 },
             )
         except Exception as exc:
@@ -197,12 +238,12 @@ class WebSearchTool(BaseTool):
             )
 
         try:
-            formatted = self._duckduckgo_search(query, max_results)
+            formatted = self._duckduckgo_search(query, max_results, include_domains)
             return ToolResult(
                 tool_name="web_search",
                 content=formatted or "No results found.",
                 success=True,
-                metadata={"engine": "duckduckgo"},
+                metadata={"engine": "duckduckgo", "include_domains": include_domains},
             )
         except ImportError:
             return ToolResult(

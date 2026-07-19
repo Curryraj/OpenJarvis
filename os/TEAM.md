@@ -166,15 +166,53 @@ immediately before the real user turn. There are **no tool-call traces** in that
 few-shot here can only teach the *shape of the answer* — it cannot demonstrate "make three narrow
 searches instead of one". The single-broad-search habit needs a different lever.
 
-**The two exemplars are deliberately paired** on the same topic (UK public EV chargers):
-1. an answerable question → concrete figures first, named source, flags a real definitional
-   change that breaks comparisons, sources list, zero filler;
-2. a **deliberately unanswerable** one (a 2035 projection) → states plainly that no published
-   figure was found, names what was searched, gives the verified baseline instead, and explicitly
-   refuses to extrapolate a number that would look sourced but isn't.
+**⚠️ THE ORIGINAL TWO-EXEMPLAR DESIGN WAS WRONG AND CAUSED FABRICATION. Corrected below —
+only ONE exemplar ships.**
 
-The pairing is the point: one question that should be answered and one that should not, so the
-model learns to *discriminate* rather than to always hedge or always assert.
+The first design paired an *answerable* question (UK public EV chargers → concrete figures with
+sources) with an *unanswerable* one (a 2035 projection → states the gap). The intent was to teach
+discrimination. The effect was the opposite.
+
+**What actually happened.** Asked "How many engineering graduates does the UK produce each year?"
+Researcher stopped calling `web_search` entirely and answered from training memory with a
+**fabricated HESA URL** — three separate runs, three different invented URLs, one of which
+included a fake "Web search results:" block it had simply written itself. It was roleplaying
+research.
+
+**Root cause — a property of the format, not the wording.** Exemplars inject as plain
+USER/ASSISTANT text with **no tool-call traces**. So an exemplar showing a confident, sourced
+answer to a factual question does not teach "search, then report". It teaches *"a question shaped
+like this is answered immediately with figures and URLs."* The failing question was structurally
+identical to the answerable exemplar ("How many public EV chargers are there in the UK?").
+
+**The rule that follows:** in a format that cannot show the retrieval, every exemplar must model a
+behaviour that is safe to imitate *without* the underlying work.
+- "Here are the figures and sources" → imitated blind, becomes **fabrication**. Never safe.
+- "Here's what I found, here's what I couldn't, here's what I searched" → imitated blind, becomes
+  **honesty**. Self-limiting, because you can copy the shape of admitting a gap without having any
+  data and the result is still true.
+
+**Verified by controlled test** (same question, same prompt, only the exemplars varied):
+
+| Exemplars | Searched? | Sources |
+|---|---|---|
+| Both (answerable + gap) | ✗ 3/3 runs | fabricated HESA URLs |
+| None | ✓ | real: gov.uk, hesa.ac.uk/data-and-analysis/graduates |
+| Gap-admission only | ✓ | real: hesa.ac.uk, theiet.org |
+
+So `few_shot.json` now contains **only the gap-admission exemplar**. Do not add an exemplar that
+answers a factual question with figures, however well-sourced those figures are.
+
+**A diagnostic error worth recording:** the fabrication was first blamed on a "Source Quality"
+prompt section added in the same batch. That section was reverted and the fabrication *persisted*
+— disproving the explanation. The real cause was found by comparing which questions failed
+(short factual counts) against which succeeded (broad or future-facing), not by reasoning forward
+from the theory. Revert-and-retest is what settled it.
+
+**Residual flaw, different in kind:** with the gap exemplar only, Researcher answered the graduate
+question with *entrants* (70,845 started engineering & technology courses) rather than graduates.
+Real, sourced data, wrong metric — a comprehension error, not a fabrication, and far less
+dangerous because it is checkable.
 
 ⚠️ **Staleness liability.** Exemplar content is injected on every Researcher turn, so any figure
 in it is a fact the model sees constantly and may parrot. Both exemplars therefore use **real,
@@ -185,6 +223,27 @@ in an exemplar.
 
 The EV topic was chosen because it is far from Jaiydaan's actual research subjects — if the model
 ever parrots an exemplar figure into an unrelated answer, it is obvious rather than camouflaged.
+
+### Source quality — partially solved, by accident (2026-07-20)
+
+Researcher favoured recruiter blogs and SEO listicles over primary sources. Two contributing
+causes were found:
+
+1. **No `TAVILY_API_KEY` is set**, so every search falls through to the DuckDuckGo path, which
+   ranks by SEO. Content-marketing pages are exactly what that surfaces. Setting a free Tavily key
+   would raise the baseline; not done (needs Jaiydaan's signup).
+2. **`web_search` exposed no domain filtering** despite Tavily supporting it. Fixed — the tool now
+   takes `include_domains`, passed straight through to Tavily and rewritten as OR-ed `site:`
+   operators for the DDG fallback. Verified directly: `"number of UK engineering graduates per
+   year"` unfiltered returned a CV-marketing site and Statista; filtered to
+   `["gov.uk","hesa.ac.uk","ons.gov.uk","engineeringuk.com"]` it returned 5/5 EngineeringUK
+   primary reports.
+
+**But the prompt does NOT currently instruct the agent to use `include_domains`.** The section
+that did was reverted during the fabrication investigation, and once exemplar #1 was removed
+Researcher began reaching gov.uk and HESA on its own anyway. Re-adding domain guidance is an open
+option, deliberately left untested rather than layering unproven complexity onto a just-stabilised
+agent. `include_domains` remains available for direct/manual calls regardless.
 
 ## Bench (available to activate)
 
